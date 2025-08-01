@@ -100,6 +100,7 @@ type Debugger struct {
 	pcBreakpoints map[int]*Breakpoint // PC to breakpoint mapping for fast lookup
 	stepDepth     int                 // Call stack depth for step over/out
 	stepMode      DebugCommand
+	lastPC        int                 // Previous PC for step-over flow control
 
 	// Variable reference management for DAP
 	variableRefs map[int]interface{} // Maps reference IDs to values or scopes
@@ -227,6 +228,7 @@ func (d *Debugger) StepOver() {
 	d.flags &^= FlagPaused
 	d.stepMode = DebugStepOver
 	d.stepDepth = len(d.runtime.vm.callStack)
+	d.lastPC = -1 // Reset lastPC to allow first step
 }
 
 // StepInto executes the next line, stepping into function calls
@@ -327,8 +329,13 @@ func (d *Debugger) checkBreakpoint(vm *vm) bool {
 			return true
 		case DebugStepOver:
 			if len(vm.callStack) <= d.stepDepth {
-				d.flags |= FlagPaused
-				return true
+				// Check if we're at a consecutive instruction or there was a jump
+				// This helps with control flow like if/else where we shouldn't pause
+				// in unreachable branches
+				if d.lastPC == -1 || vm.pc == d.lastPC+1 || len(vm.callStack) < d.stepDepth {
+					d.flags |= FlagPaused
+					return true
+				}
 			}
 		case DebugStepOut:
 			if len(vm.callStack) < d.stepDepth {
@@ -423,6 +430,14 @@ func (d *Debugger) handlePause(vm *vm) {
 
 	// Call handler and process command
 	cmd := handler(state)
+	
+	// Update lastPC for step-over flow control
+	d.mu.Lock()
+	if vm.prg != nil {
+		d.lastPC = vm.pc
+	}
+	d.mu.Unlock()
+	
 	switch cmd {
 	case DebugContinue:
 		d.Continue()

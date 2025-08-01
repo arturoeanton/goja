@@ -1,6 +1,7 @@
 package goja
 
 import (
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -358,4 +359,102 @@ func TestDebuggerStepOut(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Timeout waiting for step out")
 	}
+}
+
+func TestStepOverFlowControl(t *testing.T) {
+	const script = `
+var x = 5;
+var y = 10;
+var sum = x + y;
+debugger;
+if (sum > 10) {
+    console.log("Sum is greater than 10");  // Line 6 - should execute
+} else {
+    console.log("Sum is 10 or less");       // Line 8 - should NOT execute
+}
+console.log("End of script");                // Line 10 - should execute after line 6
+`
+
+	rt := New()
+	var logs []string
+	var pauseEvents []int
+
+	// Mock console.log to capture output
+	console := rt.NewObject()
+	console.Set("log", func(msg string) {
+		logs = append(logs, msg)
+		t.Logf("Console.log: %s", msg)
+	})
+	rt.Set("console", console)
+
+	debugger := rt.EnableDebugger()
+
+	debugger.SetHandler(func(state *DebuggerState) DebugCommand {
+		pauseEvents = append(pauseEvents, state.SourcePos.Line)
+		t.Logf("Paused at line %d: %s", state.SourcePos.Line, getLineContent(script, state.SourcePos.Line))
+
+		// Let the debugger statement pause, then step over through the if/else
+		if state.SourcePos.Line == 5 { // debugger statement
+			return DebugStepOver
+		}
+		if state.SourcePos.Line == 6 { // "Sum is greater than 10"
+			return DebugStepOver
+		}
+		if state.SourcePos.Line == 10 { // "End of script"
+			return DebugContinue
+		}
+		// If we pause at line 8 (the else branch), that's the bug
+		if state.SourcePos.Line == 8 {
+			t.Errorf("BUG: Paused at line 8 (else branch) when it shouldn't execute")
+		}
+		return DebugContinue
+	})
+
+	// Compile and run
+	prg, err := Compile("test", script, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = rt.RunProgram(prg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify results
+	t.Logf("Pause events at lines: %v", pauseEvents)
+	t.Logf("Console logs: %v", logs)
+
+	// Should only have logged from the if branch, not the else
+	expectedLog := "Sum is greater than 10"
+	unexpectedLog := "Sum is 10 or less"
+
+	found := false
+	for _, log := range logs {
+		if strings.Contains(log, expectedLog) {
+			found = true
+		}
+		if strings.Contains(log, unexpectedLog) {
+			t.Errorf("BUG: Found unexpected log from else branch: %s", log)
+		}
+	}
+
+	if !found {
+		t.Errorf("Expected log not found: %s", expectedLog)
+	}
+
+	// Should not pause at line 8 (else branch)
+	for _, line := range pauseEvents {
+		if line == 8 {
+			t.Errorf("BUG: Debugger paused at line 8 (else branch) when it shouldn't")
+		}
+	}
+}
+
+func getLineContent(script string, lineNum int) string {
+	lines := strings.Split(script, "\n")
+	if lineNum > 0 && lineNum <= len(lines) {
+		return strings.TrimSpace(lines[lineNum-1])
+	}
+	return ""
 }
