@@ -1,6 +1,7 @@
 package goja
 
 import (
+	"fmt"
 	"sync"
 )
 
@@ -35,11 +36,36 @@ func (b *Breakpoint) ID() int {
 	return b.id
 }
 
+// Variable represents a variable in the debug context
+type Variable struct {
+	Name  string
+	Value Value
+	Type  string
+	Ref   int // Reference ID for complex types (objects, arrays)
+}
+
+// Scope represents a variable scope
+type Scope struct {
+	Name          string // "Local", "Closure", "Global"
+	VariablesRef  int    // Reference ID to get variables
+	Expensive     bool   // If true, variables should be retrieved lazily
+	NamedVariables int   // Number of named variables
+	IndexedVariables int // Number of indexed variables (for arrays)
+}
+
+// DebugStackFrame extends StackFrame with debug information
+type DebugStackFrame struct {
+	StackFrame
+	Scopes []Scope
+	This   *Variable // The 'this' value in the context
+}
+
 // DebuggerState represents the current state when paused
 type DebuggerState struct {
 	PC         int
 	SourcePos  Position
 	CallStack  []StackFrame
+	DebugStack []DebugStackFrame // Extended stack frames with variable info
 	Breakpoint *Breakpoint // Current breakpoint if stopped at one
 	StepMode   bool
 }
@@ -71,6 +97,10 @@ type Debugger struct {
 	pcBreakpoints map[int]*Breakpoint // PC to breakpoint mapping for fast lookup
 	stepDepth     int                 // Call stack depth for step over/out
 	stepMode      DebugCommand
+	
+	// Variable reference management for DAP
+	variableRefs map[int]interface{} // Maps reference IDs to values or scopes
+	nextVarRef   int
 }
 
 // NewDebugger creates a new debugger for the runtime
@@ -79,6 +109,8 @@ func (r *Runtime) NewDebugger() *Debugger {
 		runtime:       r,
 		breakpoints:   make(map[int]*Breakpoint),
 		pcBreakpoints: make(map[int]*Breakpoint),
+		variableRefs:  make(map[int]interface{}),
+		nextVarRef:    1000, // Start from 1000 to avoid conflicts with frame IDs
 	}
 }
 
@@ -265,6 +297,14 @@ func (d *Debugger) checkBreakpoint(vm *vm) bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
+	// Skip debugger events when in native functions
+	// This prevents confusing debug events when executing native code like console.log
+	// But still allow paused state and explicit breakpoints
+	if vm.prg == nil {
+		// Only check if already paused (from debugger statement for example)
+		return d.flags&FlagPaused != 0
+	}
+
 	// Check if paused
 	if d.flags&FlagPaused != 0 {
 		return true
@@ -301,6 +341,11 @@ func (d *Debugger) checkBreakpoint(vm *vm) bool {
 
 // handlePause is called when the VM pauses
 func (d *Debugger) handlePause(vm *vm) {
+	// Skip if in native function
+	if vm.prg == nil {
+		return
+	}
+	
 	d.mu.RLock()
 	handler := d.handler
 	d.mu.RUnlock()
@@ -339,6 +384,9 @@ func (d *Debugger) handlePause(vm *vm) {
 
 	// Capture call stack
 	state.CallStack = d.runtime.CaptureCallStack(0, nil)
+	
+	// Build debug stack with variable information
+	state.DebugStack = d.buildDebugStack(vm)
 
 	// Call handler and process command
 	cmd := handler(state)
@@ -354,4 +402,417 @@ func (d *Debugger) handlePause(vm *vm) {
 	case DebugPause:
 		// Already paused, do nothing
 	}
+}
+
+// GetScopes returns the scopes for a given stack frame
+func (d *Debugger) GetScopes(frameID int) []Scope {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if d.runtime.vm == nil || frameID >= len(d.runtime.vm.callStack) {
+		return nil
+	}
+
+	// For simplicity, we'll start with just local scope
+	// In the future, we can add closure and global scopes
+	scopes := []Scope{
+		{
+			Name:         "Local",
+			VariablesRef: d.createVariableRef(frameID, "local"),
+			Expensive:    false,
+		},
+	}
+
+	// Add global scope
+	scopes = append(scopes, Scope{
+		Name:         "Global",
+		VariablesRef: d.createVariableRef(frameID, "global"),
+		Expensive:    true,
+	})
+
+	return scopes
+}
+
+// createVariableRef creates a reference for variables lookup
+func (d *Debugger) createVariableRef(frameID int, scopeType string) int {
+	// Note: This function must be called with write lock held
+	ref := d.nextVarRef
+	d.nextVarRef++
+	d.variableRefs[ref] = map[string]interface{}{
+		"frameID": frameID,
+		"type":    scopeType,
+	}
+	return ref
+}
+
+// GetVariables returns variables for a given reference (scope or object)
+func (d *Debugger) GetVariables(variablesRef int) []Variable {
+	// Handle lazy scope references (negative refs)
+	if variablesRef < 0 {
+		return d.resolveLazyScope(variablesRef)
+	}
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	refData, exists := d.variableRefs[variablesRef]
+	if !exists {
+		// Debug: log what references we have
+		if d.runtime.vm != nil {
+			for k, v := range d.variableRefs {
+				_ = k
+				_ = v
+				// fmt.Printf("Debug: Have ref %d -> %T\n", k, v)
+			}
+		}
+		return nil
+	}
+
+	switch data := refData.(type) {
+	case map[string]interface{}:
+		if scopeType, ok := data["type"].(string); ok {
+			frameID, _ := data["frameID"].(int)
+			return d.getVariablesForScope(frameID, scopeType)
+		}
+	case *Object:
+		// Handle object properties
+		return d.getObjectProperties(data)
+	}
+
+	return nil
+}
+
+// getVariablesForScope retrieves variables for a specific scope
+func (d *Debugger) getVariablesForScope(frameID int, scopeType string) []Variable {
+	var variables []Variable
+	
+	// Get the current call stack
+	stack := d.runtime.CaptureCallStack(0, nil)
+	if frameID < 0 || frameID >= len(stack) {
+		return nil
+	}
+	
+	switch scopeType {
+	case "local":
+		// Use the new GetLocalVariables method
+		frame := &stack[frameID]
+		localVars := frame.GetLocalVariables()
+		if localVars != nil {
+			variables = make([]Variable, 0, len(localVars))
+			for name, value := range localVars {
+				variable := Variable{
+					Name:  name,
+					Value: value,
+					Type:  d.getValueType(value),
+				}
+				
+				// For complex types, create a reference
+				if obj, ok := value.(*Object); ok {
+					d.mu.Lock()
+					ref := d.nextVarRef
+					d.nextVarRef++
+					d.variableRefs[ref] = obj
+					d.mu.Unlock()
+					variable.Ref = ref
+				}
+				
+				variables = append(variables, variable)
+			}
+		}
+	case "global":
+		// Get global variables
+		variables = d.extractGlobalVariables()
+	}
+
+	return variables
+}
+
+// extractStashVariables extracts variables from a stash
+func (d *Debugger) extractStashVariables(s *stash) []Variable {
+	if s == nil || s.names == nil {
+		return nil
+	}
+
+	variables := make([]Variable, 0, len(s.names))
+	
+	for name, idx := range s.names {
+		if int(idx) < len(s.values) && s.values[idx] != nil {
+			v := s.values[idx]
+			variable := Variable{
+				Name:  name.String(),
+				Value: v,
+				Type:  d.getValueType(v),
+			}
+			
+			// For complex types, create a reference
+			if obj, ok := v.(*Object); ok {
+				ref := d.nextVarRef
+				d.nextVarRef++
+				d.variableRefs[ref] = obj
+				variable.Ref = ref
+			}
+			
+			variables = append(variables, variable)
+		}
+	}
+
+	return variables
+}
+
+// extractGlobalVariables extracts global variables
+func (d *Debugger) extractGlobalVariables() []Variable {
+	globalObj := d.runtime.globalObject
+	if globalObj == nil {
+		return nil
+	}
+
+	var variables []Variable
+	
+	// Iterate through global object properties
+	for item, next := globalObj.self.iterateStringKeys()(); next != nil; item, next = next() {
+		nameStr := item.name.string()
+		prop := globalObj.self.getStr(nameStr, nil)
+		if prop != nil {
+			variable := Variable{
+				Name:  nameStr.String(),
+				Value: prop,
+				Type:  d.getValueType(prop),
+			}
+			
+			// For complex types, create a reference
+			if obj, ok := prop.(*Object); ok {
+				ref := d.nextVarRef
+				d.nextVarRef++
+				d.variableRefs[ref] = obj
+				variable.Ref = ref
+			}
+			
+			variables = append(variables, variable)
+		}
+	}
+
+	return variables
+}
+
+// getObjectProperties extracts properties from an object
+func (d *Debugger) getObjectProperties(obj *Object) []Variable {
+	if obj == nil {
+		return nil
+	}
+
+	var variables []Variable
+	
+	// Iterate through object properties
+	for item, next := obj.self.iterateStringKeys()(); next != nil; item, next = next() {
+		nameStr := item.name.string()
+		prop := obj.self.getStr(nameStr, nil)
+		if prop != nil {
+			variable := Variable{
+				Name:  nameStr.String(),
+				Value: prop,
+				Type:  d.getValueType(prop),
+			}
+			
+			// For nested objects, create a reference
+			if nestedObj, ok := prop.(*Object); ok {
+				ref := d.nextVarRef
+				d.nextVarRef++
+				d.variableRefs[ref] = nestedObj
+				variable.Ref = ref
+			}
+			
+			variables = append(variables, variable)
+		}
+	}
+
+	return variables
+}
+
+// getValueType returns a string representation of the value's type
+func (d *Debugger) getValueType(v Value) string {
+	if v == nil {
+		return "undefined"
+	}
+	
+	switch val := v.(type) {
+	case valueNull:
+		return "null"
+	case valueUndefined:
+		return "undefined"
+	case valueInt, valueFloat, *valueBigInt:
+		return "number"
+	case String:
+		return "string"
+	case valueBool:
+		return "boolean"
+	case *Object:
+		// Check for specific object types
+		className := val.self.className()
+		switch className {
+		case "Array":
+			return "array"
+		case "Function":
+			return "function"
+		case "Date":
+			return "date"
+		case "RegExp":
+			return "regexp"
+		case "Error":
+			return "error"
+		default:
+			return "object"
+		}
+	default:
+		return "unknown"
+	}
+}
+
+// Evaluate evaluates an expression in the context of a frame
+func (d *Debugger) Evaluate(expression string, frameID int) (Value, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	// This is a simplified implementation
+	// A full implementation would need to:
+	// 1. Parse the expression
+	// 2. Evaluate it in the context of the specified frame
+	// 3. Handle errors appropriately
+	
+	// For now, we'll use the runtime's RunString in the global context
+	// In the future, this should evaluate in the frame's context
+	return d.runtime.RunString(expression)
+}
+
+// EvaluateInFrame evaluates an expression in the context of a specific stack frame
+func (d *Debugger) EvaluateInFrame(expression string, frameIndex int) (Value, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if d.runtime.vm == nil {
+		return nil, fmt.Errorf("no active execution context")
+	}
+
+	// Get the current call stack
+	stack := d.runtime.CaptureCallStack(0, nil)
+	if frameIndex < 0 || frameIndex >= len(stack) {
+		return nil, fmt.Errorf("invalid frame index: %d", frameIndex)
+	}
+
+	frame := &stack[frameIndex]
+	
+	// If the frame has no context, evaluate in global scope
+	if frame.ctx == nil || frame.ctx.stash == nil {
+		return d.runtime.RunString(expression)
+	}
+
+	// Create a temporary evaluation context with the frame's variables
+	// This is a simplified implementation that creates a new scope with the frame's variables
+	evalCode := "(function() {\n"
+	
+	// Inject local variables from the frame's stash
+	if frame.ctx.stash.names != nil {
+		for name, idx := range frame.ctx.stash.names {
+			if int(idx) < len(frame.ctx.stash.values) && frame.ctx.stash.values[idx] != nil {
+				// Create a variable declaration for each local variable
+				evalCode += fmt.Sprintf("var %s = this._%s;\n", name.String(), name.String())
+			}
+		}
+	}
+	
+	// Add the expression to evaluate
+	evalCode += "return (" + expression + ");\n"
+	evalCode += "}).call(this)"
+	
+	// Create an object with the frame's variables
+	varsObj := d.runtime.NewObject()
+	if frame.ctx.stash.names != nil {
+		for name, idx := range frame.ctx.stash.names {
+			if int(idx) < len(frame.ctx.stash.values) && frame.ctx.stash.values[idx] != nil {
+				varsObj.Set("_"+name.String(), frame.ctx.stash.values[idx])
+			}
+		}
+	}
+	
+	// Save current global state
+	savedGlobal := d.runtime.globalObject
+	
+	// Temporarily set the variables object as 'this'
+	d.runtime.globalObject = varsObj
+	
+	// Evaluate the expression
+	result, err := d.runtime.RunString(evalCode)
+	
+	// Restore global state
+	d.runtime.globalObject = savedGlobal
+	
+	return result, err
+}
+
+// buildDebugStack builds the debug stack with variable information
+func (d *Debugger) buildDebugStack(vm *vm) []DebugStackFrame {
+	if vm == nil {
+		return nil
+	}
+
+	// Get the regular call stack first
+	callStack := d.runtime.CaptureCallStack(0, nil)
+	debugStack := make([]DebugStackFrame, len(callStack))
+
+	// Create scope references that will be populated lazily
+	for i, frame := range callStack {
+		debugFrame := DebugStackFrame{
+			StackFrame: frame,
+		}
+
+		// Build scopes for this frame
+		// Use negative refs for lazy loading - will be resolved in GetScopes
+		scopes := []Scope{
+			{
+				Name:         "Local",
+				VariablesRef: -(i*10 + 1), // Negative to indicate it needs resolution
+				Expensive:    false,
+			},
+		}
+
+		// Only add global scope for the first frame to avoid duplication
+		if i == 0 {
+			scopes = append(scopes, Scope{
+				Name:         "Global",
+				VariablesRef: -(i*10 + 2), // Negative to indicate it needs resolution
+				Expensive:    true,
+			})
+		}
+
+		debugFrame.Scopes = scopes
+
+		// Get 'this' value for the frame
+		// For now, we'll leave this as nil
+		// TODO: Extract 'this' value from the context
+
+		debugStack[i] = debugFrame
+	}
+
+	return debugStack
+}
+
+// resolveLazyScope resolves a lazy scope reference and returns its variables
+func (d *Debugger) resolveLazyScope(lazyRef int) []Variable {
+	// Extract frame ID and scope type from the negative reference
+	// lazyRef = -(frameID*10 + scopeID)
+	// scopeID: 1 = local, 2 = global
+	absRef := -lazyRef
+	frameID := absRef / 10
+	scopeID := absRef % 10
+	
+	var scopeType string
+	switch scopeID {
+	case 1:
+		scopeType = "local"
+	case 2:
+		scopeType = "global"
+	default:
+		return nil
+	}
+	
+	return d.getVariablesForScope(frameID, scopeType)
 }
