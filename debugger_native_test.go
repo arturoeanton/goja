@@ -188,3 +188,116 @@ func TestDebuggerWithDebugMode(t *testing.T) {
 		t.Error("Failed to find local variable in debug mode")
 	}
 }
+
+func TestDebuggerNativeCallFlags(t *testing.T) {
+	vm := New()
+	debugger := vm.EnableDebugger()
+	
+	// Track debug events
+	var nativeCallCount int
+	var regularCallCount int
+	
+	debugger.SetHandler(func(state *DebuggerState) DebugCommand {
+		t.Logf("Debug event: PC=%d, InNative=%v, Name=%s, Line=%d", 
+			state.PC, state.InNativeCall, state.NativeFunctionName, state.SourcePos.Line)
+		if state.InNativeCall {
+			nativeCallCount++
+			t.Logf("Native call: %s", state.NativeFunctionName)
+		} else {
+			regularCallCount++
+		}
+		return DebugContinue
+	})
+	
+	// Enable step mode to capture all events
+	debugger.SetStepMode(true)
+	
+	// Add console.log
+	console := vm.NewObject()
+	console.Set("log", func(call FunctionCall) Value {
+		return _undefined
+	})
+	vm.Set("console", console)
+	
+	// Test script with native function calls
+	script := `
+		console.log("Hello");
+		var x = 1 + 2;
+		console.log("World");
+	`
+	
+	_, err := vm.RunString(script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	
+	// Verify we detected native calls
+	if nativeCallCount == 0 {
+		t.Error("No native calls detected")
+	}
+	
+	if regularCallCount == 0 {
+		t.Error("No regular JS execution detected")
+	}
+	
+	t.Logf("Native calls: %d, Regular calls: %d", nativeCallCount, regularCallCount)
+}
+
+func TestDebuggerIsInNativeCallAPI(t *testing.T) {
+	vm := New()
+	debugger := vm.EnableDebugger()
+	
+	// Track when we're in native calls
+	inNativeCall := false
+	
+	debugger.SetHandler(func(state *DebuggerState) DebugCommand {
+		// Verify the IsInNativeCall method matches the state
+		if state.InNativeCall != debugger.IsInNativeCall() {
+			t.Errorf("State mismatch: state.InNativeCall=%v, IsInNativeCall()=%v", 
+				state.InNativeCall, debugger.IsInNativeCall())
+		}
+		
+		if state.InNativeCall {
+			inNativeCall = true
+			// Verify we can get the native function name
+			name := debugger.GetNativeFunctionName()
+			if name == "" {
+				t.Error("GetNativeFunctionName returned empty string during native call")
+			}
+			t.Logf("In native function: %s", name)
+		}
+		
+		return DebugContinue
+	})
+	
+	debugger.SetStepMode(true)
+	
+	// Add a native function
+	vm.Set("nativeFunc", func(call FunctionCall) Value {
+		return vm.ToValue("native result")
+	})
+	
+	script := `
+		var result = nativeFunc("test");
+		result;
+	`
+	
+	_, err := vm.RunString(script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	
+	if !inNativeCall {
+		t.Error("Never detected being in a native call")
+	}
+}
+
+func TestDebuggerShouldStepInNativeCallAPI(t *testing.T) {
+	vm := New()
+	debugger := vm.EnableDebugger()
+	
+	// Verify default behavior
+	if debugger.ShouldStepInNativeCall() {
+		t.Error("ShouldStepInNativeCall should return false by default")
+	}
+}

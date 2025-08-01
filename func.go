@@ -566,8 +566,18 @@ func (f *nativeFuncObject) assertCallable() (func(FunctionCall) Value, bool) {
 func (f *nativeFuncObject) vmCall(vm *vm, n int) {
 	if f.f != nil {
 		vm.pushCtx()
+		oldPrg := vm.prg
 		vm.prg = nil
 		vm.sb = vm.sp - n // so that [sb-1] points to the callee
+		
+		// Trigger debugger if needed (entering native function)
+		if vm.r.debugger != nil {
+			// The debugger will detect we're in native mode because vm.prg == nil
+			if vm.r.debugger.checkBreakpoint(vm) {
+				vm.r.debugger.handlePause(vm)
+			}
+		}
+		
 		ret := f.f(FunctionCall{
 			Arguments: vm.stack[vm.sp-n : vm.sp],
 			This:      vm.stack[vm.sp-n-2],
@@ -576,6 +586,10 @@ func (f *nativeFuncObject) vmCall(vm *vm, n int) {
 			ret = _undefined
 		}
 		vm.stack[vm.sp-n-2] = ret
+		
+		// Restore program state
+		vm.prg = oldPrg
+		
 		vm.popCtx()
 	} else {
 		vm.stack[vm.sp-n-2] = _undefined
