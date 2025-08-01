@@ -1461,9 +1461,15 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 				firstDupIdx = offset
 			}
 			b.isArg = true
+			if e.c.debugMode {
+				b.moveToStash()
+			}
 		case ast.Pattern:
 			b := s.addBinding(int(item.Idx0()) - 1)
 			b.isArg = true
+			if e.c.debugMode {
+				b.moveToStash()
+			}
 			hasPatterns = true
 		default:
 			e.c.throwSyntaxError(int(item.Idx0())-1, "Unsupported BindingElement type: %T", item)
@@ -1724,7 +1730,7 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 				extensible:  s.dynamic,
 				funcType:    e.typ,
 			}
-			if s.isDynamic() {
+			if s.isDynamic() || e.c.debugMode {
 				enter1.names = s.makeNamesMap()
 			}
 			enter = &enter1
@@ -1744,7 +1750,7 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 				extensible: s.dynamic,
 				funcType:   e.typ,
 			}
-			if s.isDynamic() {
+			if s.isDynamic() || e.c.debugMode {
 				enter1.names = s.makeNamesMap()
 			}
 			enter = &enter1
@@ -2299,7 +2305,7 @@ func (e *compiledClassLiteral) compileFieldsAndStaticBlocks(elements []clsElemen
 			stashSize: 1,
 			funcType:  funcClsInit,
 		}
-		if s.dynLookup {
+		if s.dynLookup || e.c.debugMode {
 			enter.names = s.makeNamesMap()
 		}
 		e.c.p.code[0] = enter

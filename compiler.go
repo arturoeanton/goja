@@ -89,6 +89,8 @@ type compiler struct {
 	codeScratchpad []instruction
 
 	stringCache map[unistring.String]Value
+	
+	debugMode bool // Force all variables to stash for debugging
 }
 
 type binding struct {
@@ -409,8 +411,13 @@ func (c *compiler) emitLiteralValue(v Value) {
 }
 
 func newCompiler() *compiler {
+	return newCompilerWithDebugMode(false)
+}
+
+func newCompilerWithDebugMode(debugMode bool) *compiler {
 	c := &compiler{
-		p: &Program{},
+		p:         &Program{},
+		debugMode: debugMode,
 	}
 
 	c.enumGetExpr.init(c, file.Idx(0))
@@ -1109,7 +1116,10 @@ func (c *compiler) createVarIdBinding(name unistring.String, offset int, inFunc 
 		c.checkIdentifierName(name, offset)
 	}
 	if !inFunc || name != "arguments" {
-		c.scope.bindName(name)
+		b, _ := c.scope.bindName(name)
+		if c.debugMode && b != nil {
+			b.moveToStash()
+		}
 	}
 }
 
@@ -1171,6 +1181,9 @@ func (c *compiler) createLexicalIdBinding(name unistring.String, isConst bool, o
 	if isConst {
 		b.isConst, b.isStrict = true, true
 	}
+	if c.debugMode && b != nil {
+		b.moveToStash()
+	}
 	return b
 }
 
@@ -1192,6 +1205,9 @@ func (c *compiler) createLexicalIdBindingFuncBody(name unistring.String, isConst
 	b, _ := c.scope.bindNameLexical(name, true, offset)
 	if isConst {
 		b.isConst, b.isStrict = true, true
+	}
+	if c.debugMode && b != nil {
+		b.moveToStash()
 	}
 	return b
 }
