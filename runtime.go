@@ -198,6 +198,7 @@ type Runtime struct {
 	idSeq          uint64
 	debugger       *Debugger
 	enhancedErrors bool
+	debugMode      bool
 
 	jobQueue []func()
 
@@ -209,6 +210,9 @@ type StackFrame struct {
 	prg      *Program
 	funcName unistring.String
 	pc       int
+	// Internal: reference to the context for accessing variables
+	ctx      *context // Internal use only
+	vm       *vm      // Internal use only
 }
 
 func (f *StackFrame) SrcName() string {
@@ -226,6 +230,76 @@ func (f *StackFrame) FuncName() string {
 		return "<anonymous>"
 	}
 	return f.funcName.String()
+}
+
+// GetLocalVariables returns the local variables available in this stack frame
+func (f *StackFrame) GetLocalVariables() map[string]Value {
+	if f.ctx == nil || f.ctx.stash == nil {
+		return nil
+	}
+	
+	vars := make(map[string]Value)
+	stash := f.ctx.stash
+	
+	// Extract variables from the stash
+	if stash.names != nil {
+		for name, idx := range stash.names {
+			// Mask off type flags to get actual index
+			actualIdx := idx &^ (1<<31 | 1<<30 | 1<<29)
+			if int(actualIdx) < len(stash.values) && stash.values[actualIdx] != nil {
+				vars[name.String()] = stash.values[actualIdx]
+			}
+		}
+	}
+	
+	// If no names in stash, check if we're looking at the wrong stash
+	// Sometimes variables might be in an outer stash (closure)
+	if len(vars) == 0 && stash.outer != nil {
+		outerStash := stash.outer
+		if outerStash.names != nil {
+			for name, idx := range outerStash.names {
+				// Mask off type flags to get actual index
+				actualIdx := idx &^ (1<<31 | 1<<30 | 1<<29)
+				if int(actualIdx) < len(outerStash.values) && outerStash.values[actualIdx] != nil {
+					vars[name.String()] = outerStash.values[actualIdx]
+				}
+			}
+		}
+	}
+	
+	return vars
+}
+
+// GetArguments returns the function arguments for this stack frame
+func (f *StackFrame) GetArguments() []Value {
+	if f.ctx == nil || f.ctx.stash == nil {
+		return nil
+	}
+	
+	// Arguments are typically stored at the beginning of the stash values
+	// The number of arguments is stored in ctx.args
+	if f.ctx.args > 0 && len(f.ctx.stash.values) >= f.ctx.args {
+		args := make([]Value, f.ctx.args)
+		copy(args, f.ctx.stash.values[:f.ctx.args])
+		return args
+	}
+	
+	return nil
+}
+
+// GetThis returns the 'this' value for this stack frame
+func (f *StackFrame) GetThis() Value {
+	if f.vm == nil || f.ctx == nil {
+		return nil
+	}
+	
+	// The 'this' value is typically at stack[sb-2] for methods
+	// For regular functions, it might be undefined or the global object
+	if f.ctx.sb >= 2 && f.ctx.sb <= len(f.vm.stack) {
+		return f.vm.stack[f.ctx.sb-2]
+	}
+	
+	return nil
 }
 
 func (f *StackFrame) Position() file.Position {
@@ -1299,6 +1373,22 @@ func (r *Runtime) toBoolean(b bool) Value {
 	}
 }
 
+// RuntimeOptions contains configuration options for creating a new Runtime
+type RuntimeOptions struct {
+	// EnableDebugMode forces all variables to be stored in the stash for debugging purposes.
+	// This has a performance impact and should only be used when debugging is needed.
+	EnableDebugMode bool
+}
+
+// NewWithOptions creates a new Runtime with the specified options
+func NewWithOptions(opts RuntimeOptions) *Runtime {
+	r := &Runtime{
+		debugMode: opts.EnableDebugMode,
+	}
+	r.init()
+	return r
+}
+
 // New creates an instance of a Javascript runtime that can be used to run code. Multiple instances may be created and
 // used simultaneously, however it is not possible to pass JS values across runtimes.
 func New() *Runtime {
@@ -1355,16 +1445,24 @@ func Parse(name, src string, options ...parser.Option) (prg *js_ast.Program, err
 }
 
 func compile(name, src string, strict, inGlobal bool, evalVm *vm, parserOptions ...parser.Option) (p *Program, err error) {
+	return compileWithDebugMode(name, src, strict, inGlobal, evalVm, false, parserOptions...)
+}
+
+func compileWithDebugMode(name, src string, strict, inGlobal bool, evalVm *vm, debugMode bool, parserOptions ...parser.Option) (p *Program, err error) {
 	prg, err := Parse(name, src, parserOptions...)
 	if err != nil {
 		return
 	}
 
-	return compileAST(prg, strict, inGlobal, evalVm)
+	return compileASTWithDebugMode(prg, strict, inGlobal, evalVm, debugMode)
 }
 
 func compileAST(prg *js_ast.Program, strict, inGlobal bool, evalVm *vm) (p *Program, err error) {
-	c := newCompiler()
+	return compileASTWithDebugMode(prg, strict, inGlobal, evalVm, false)
+}
+
+func compileASTWithDebugMode(prg *js_ast.Program, strict, inGlobal bool, evalVm *vm, debugMode bool) (p *Program, err error) {
+	c := newCompilerWithDebugMode(debugMode)
 
 	defer func() {
 		if x := recover(); x != nil {
@@ -1384,7 +1482,7 @@ func compileAST(prg *js_ast.Program, strict, inGlobal bool, evalVm *vm) (p *Prog
 }
 
 func (r *Runtime) compile(name, src string, strict, inGlobal bool, evalVm *vm) (p *Program, err error) {
-	p, err = compile(name, src, strict, inGlobal, evalVm, r.parserOptions...)
+	p, err = compileWithDebugMode(name, src, strict, inGlobal, evalVm, r.debugMode, r.parserOptions...)
 	if err != nil {
 		switch x1 := err.(type) {
 		case *CompilerSyntaxError:
@@ -1511,6 +1609,11 @@ func (r *Runtime) GetDebugger() *Debugger {
 func (r *Runtime) EnableDebugger() *Debugger {
 	debugger := r.GetDebugger()
 	return debugger
+}
+
+// IsDebugMode returns true if the runtime was created with debug mode enabled
+func (r *Runtime) IsDebugMode() bool {
+	return r.debugMode
 }
 
 // CaptureCallStack appends the current call stack frames to the stack slice (which may be nil) up to the specified depth.
