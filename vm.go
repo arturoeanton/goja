@@ -726,7 +726,15 @@ func (vm *vm) captureStack(stack []StackFrame, ctxOffset int) []StackFrame {
 		} else {
 			funcName = getFuncName(vm.stack, vm.sb)
 		}
-		stack = append(stack, StackFrame{prg: vm.prg, pc: vm.pc, funcName: funcName})
+		// Create a proper context for the current frame
+		// Note: we need to copy the context to avoid it being modified
+		currentCtx := &context{
+			prg:   vm.prg,
+			stash: vm.stash, // This is the actual current stash
+			sb:    vm.sb,
+			args:  vm.args,
+		}
+		stack = append(stack, StackFrame{prg: vm.prg, pc: vm.pc, funcName: funcName, ctx: currentCtx, vm: vm})
 	}
 	for i := len(vm.callStack) - 1; i > ctxOffset-1; i-- {
 		frame := &vm.callStack[i]
@@ -737,7 +745,8 @@ func (vm *vm) captureStack(stack []StackFrame, ctxOffset int) []StackFrame {
 			} else {
 				funcName = getFuncName(vm.stack, frame.sb)
 			}
-			stack = append(stack, StackFrame{prg: vm.callStack[i].prg, pc: frame.pc, funcName: funcName})
+			// Use the frame's context directly - it should have the correct stash
+			stack = append(stack, StackFrame{prg: vm.callStack[i].prg, pc: frame.pc, funcName: funcName, ctx: frame, vm: vm})
 		}
 	}
 	if ctxOffset == 0 && vm.curAsyncRunner != nil {
@@ -3534,6 +3543,20 @@ var pop _pop
 
 func (_pop) exec(vm *vm) {
 	vm.sp--
+	vm.pc++
+}
+
+type _debugger struct{}
+
+var debugger _debugger
+
+func (_debugger) exec(vm *vm) {
+	// Force the debugger to pause
+	if vm.r.debugger != nil {
+		vm.r.debugger.mu.Lock()
+		vm.r.debugger.flags |= FlagPaused
+		vm.r.debugger.mu.Unlock()
+	}
 	vm.pc++
 }
 
