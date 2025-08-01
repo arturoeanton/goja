@@ -629,15 +629,23 @@ func (vm *vm) run() {
 			break
 		}
 
-		// Check debugger if enabled
-		if vm.r.debugger != nil && vm.r.debugger.checkBreakpoint(vm) {
-			vm.r.debugger.handlePause(vm)
-		}
-
 		pc := vm.pc
 		if pc < 0 || pc >= len(vm.prg.code) {
 			break
 		}
+		
+		// Track actual instruction execution for debugger step-over BEFORE checking breakpoints
+		if vm.r.debugger != nil {
+			vm.r.debugger.mu.Lock()
+			vm.r.debugger.lastPC = pc
+			vm.r.debugger.mu.Unlock()
+			
+			// Check if we should pause
+			if vm.r.debugger.checkBreakpoint(vm) {
+				vm.r.debugger.handlePause(vm)
+			}
+		}
+		
 		vm.prg.code[pc].exec(vm)
 	}
 
@@ -668,15 +676,23 @@ func (vm *vm) runWithProfiler() bool {
 			return true
 		}
 
-		// Check debugger if enabled
-		if vm.r.debugger != nil && vm.r.debugger.checkBreakpoint(vm) {
-			vm.r.debugger.handlePause(vm)
-		}
-
 		pc := vm.pc
 		if pc < 0 || pc >= len(vm.prg.code) {
 			break
 		}
+		
+		// Track actual instruction execution for debugger step-over BEFORE checking breakpoints
+		if vm.r.debugger != nil {
+			vm.r.debugger.mu.Lock()
+			vm.r.debugger.lastPC = pc
+			vm.r.debugger.mu.Unlock()
+			
+			// Check if we should pause
+			if vm.r.debugger.checkBreakpoint(vm) {
+				vm.r.debugger.handlePause(vm)
+			}
+		}
+		
 		vm.prg.code[pc].exec(vm)
 		req := atomic.LoadInt32(&pt.req)
 		if req == profReqStop {

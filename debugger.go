@@ -332,7 +332,11 @@ func (d *Debugger) checkBreakpoint(vm *vm) bool {
 				// Check if we're at a consecutive instruction or there was a jump
 				// This helps with control flow like if/else where we shouldn't pause
 				// in unreachable branches
-				if d.lastPC == -1 || vm.pc == d.lastPC+1 || len(vm.callStack) < d.stepDepth {
+				isFirstStep := d.lastPC == -1
+				isConsecutive := vm.pc == d.lastPC+1
+				isReturning := len(vm.callStack) < d.stepDepth
+				
+				if isFirstStep || isConsecutive || isReturning {
 					d.flags |= FlagPaused
 					return true
 				}
@@ -430,13 +434,6 @@ func (d *Debugger) handlePause(vm *vm) {
 
 	// Call handler and process command
 	cmd := handler(state)
-	
-	// Update lastPC for step-over flow control
-	d.mu.Lock()
-	if vm.prg != nil {
-		d.lastPC = vm.pc
-	}
-	d.mu.Unlock()
 	
 	switch cmd {
 	case DebugContinue:
