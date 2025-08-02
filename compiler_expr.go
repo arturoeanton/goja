@@ -1551,7 +1551,7 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 				mark := len(e.c.p.code)
 				e.c.emit(nil)
 				e.c.emitExpr(e.c.compileExpression(item.Initializer), true)
-				if firstForwardRef == -1 && (s.isDynamic() || s.bindings[i].useCount() > 0) {
+				if firstForwardRef == -1 && (s.isDynamic() || e.c.debugMode || s.bindings[i].useCount() > 0) {
 					firstForwardRef = i
 				}
 				if firstForwardRef == -1 {
@@ -1649,11 +1649,11 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 	delta := 0
 	code := e.c.p.code
 
-	if s.isDynamic() && !s.argsInStash {
+	if (s.isDynamic() || e.c.debugMode) && !s.argsInStash {
 		s.moveArgsToStash()
 	}
 
-	if s.argsNeeded || s.isDynamic() && e.typ != funcArrow && e.typ != funcClsInit {
+	if s.argsNeeded || (s.isDynamic() || e.c.debugMode) && e.typ != funcArrow && e.typ != funcClsInit {
 		if e.typ == funcClsInit {
 			e.c.throwSyntaxError(e.offset, "'arguments' is not allowed in class field initializer or static initialization block")
 		}
@@ -1680,7 +1680,7 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 	}
 
 	if calleeBinding != nil {
-		if !s.isDynamic() && calleeBinding.useCount() == 0 {
+		if !s.isDynamic() && !e.c.debugMode && calleeBinding.useCount() == 0 {
 			s.deleteBinding(calleeBinding)
 			calleeBinding = nil
 		} else {
@@ -1693,11 +1693,11 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 
 	needInitThis := false
 	if thisBinding != nil {
-		if !s.isDynamic() && thisBinding.useCount() == 0 {
+		if !s.isDynamic() && !e.c.debugMode && thisBinding.useCount() == 0 {
 			s.deleteBinding(thisBinding)
 			thisBinding = nil
 		} else {
-			if thisBinding.inStash || s.isDynamic() {
+			if thisBinding.inStash || s.isDynamic() || e.c.debugMode {
 				delta++
 				thisBinding.emitInitAtScope(s, preambleLen-delta)
 				needInitThis = true
@@ -1720,7 +1720,7 @@ func (e *compiledFunctionLiteral) compile() (prg *Program, name unistring.String
 	delta++
 	delta = preambleLen - delta
 	var enter instruction
-	if stashSize > 0 || s.argsInStash {
+	if stashSize > 0 || s.argsInStash || e.c.debugMode {
 		if firstForwardRef == -1 {
 			enter1 := enterFunc{
 				numArgs:     uint32(paramsCount),
@@ -2290,8 +2290,8 @@ func (e *compiledClassLiteral) compileFieldsAndStaticBlocks(elements []clsElemen
 		}
 	}
 	//e.c.emit(halt)
-	if s.isDynamic() || thisBinding.useCount() > 0 {
-		if s.isDynamic() || thisBinding.inStash {
+	if s.isDynamic() || e.c.debugMode || thisBinding.useCount() > 0 {
+		if s.isDynamic() || e.c.debugMode || thisBinding.inStash {
 			thisBinding.emitInitAt(1)
 		}
 	} else {
@@ -2305,7 +2305,7 @@ func (e *compiledClassLiteral) compileFieldsAndStaticBlocks(elements []clsElemen
 			stashSize: 1,
 			funcType:  funcClsInit,
 		}
-		if s.dynLookup || e.c.debugMode {
+		if s.dynLookup || s.isDynamic() || e.c.debugMode {
 			enter.names = s.makeNamesMap()
 		}
 		e.c.p.code[0] = enter

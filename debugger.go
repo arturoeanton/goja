@@ -2,6 +2,8 @@ package goja
 
 import (
 	"fmt"
+	"log"
+	"os"
 	"strings"
 	"sync"
 )
@@ -101,21 +103,39 @@ type Debugger struct {
 	stepDepth     int                 // Call stack depth for step over/out
 	stepMode      DebugCommand
 	lastPC        int                 // Previous PC for step-over flow control
+	lastSourceLine int                // Previous source line for step-over flow control
+	continueStepAfterCall bool         // Continue stepping after a call instruction
 
 	// Variable reference management for DAP
 	variableRefs map[int]interface{} // Maps reference IDs to values or scopes
 	nextVarRef   int
+	
+	// Logger for debugging
+	logger *log.Logger
 }
 
 // NewDebugger creates a new debugger for the runtime
 func (r *Runtime) NewDebugger() *Debugger {
-	return &Debugger{
+	// Initialize logger
+	var logger *log.Logger
+	logFile, err := os.OpenFile("goja.debug.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err == nil {
+		logger = log.New(logFile, "[GOJA_CORE] ", log.Ldate|log.Ltime|log.Lmicroseconds|log.Lshortfile)
+	} else {
+		logger = log.New(os.Stderr, "[GOJA_CORE] ", log.Ldate|log.Ltime|log.Lmicroseconds|log.Lshortfile)
+	}
+	
+	d := &Debugger{
 		runtime:       r,
 		breakpoints:   make(map[int]*Breakpoint),
 		pcBreakpoints: make(map[int]*Breakpoint),
 		variableRefs:  make(map[int]interface{}),
 		nextVarRef:    1000, // Start from 1000 to avoid conflicts with frame IDs
+		logger:        logger,
 	}
+	
+	d.logger.Println("=== Debugger created ===")
+	return d
 }
 
 // SetHandler sets the debug handler that will be called when execution pauses
@@ -123,6 +143,7 @@ func (d *Debugger) SetHandler(handler DebugHandler) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.handler = handler
+	d.logger.Println("SetHandler: Debug handler set")
 }
 
 // AddBreakpoint adds a breakpoint at the specified source position
@@ -143,6 +164,7 @@ func (d *Debugger) AddBreakpoint(filename string, line, column int) int {
 
 	d.nextID++
 	d.breakpoints[bp.id] = bp
+	d.logger.Printf("AddBreakpoint: Added breakpoint #%d at %s:%d:%d\n", bp.id, filename, line, column)
 
 	// Try to resolve the breakpoint to a PC if we have a program loaded
 	if d.runtime.vm != nil && d.runtime.vm.prg != nil {
@@ -205,8 +227,10 @@ func (d *Debugger) SetStepMode(enabled bool) {
 	if enabled {
 		d.flags |= FlagStepMode
 		d.stepMode = DebugStepInto // Default to step into
+		d.logger.Printf("SetStepMode: Enabled with mode=%v\n", d.stepMode)
 	} else {
 		d.flags &^= FlagStepMode
+		d.logger.Println("SetStepMode: Disabled")
 	}
 }
 
@@ -229,6 +253,8 @@ func (d *Debugger) StepOver() {
 	d.stepMode = DebugStepOver
 	d.stepDepth = len(d.runtime.vm.callStack)
 	d.lastPC = -1 // Reset lastPC to allow first step
+	d.lastSourceLine = -1 // Reset lastSourceLine to allow first step
+	d.logger.Printf("StepOver: flags=%b, stepMode=%v, stepDepth=%d\n", d.flags, d.stepMode, d.stepDepth)
 }
 
 // StepInto executes the next line, stepping into function calls
@@ -239,6 +265,7 @@ func (d *Debugger) StepInto() {
 	d.flags |= FlagStepMode
 	d.flags &^= FlagPaused
 	d.stepMode = DebugStepInto
+	d.logger.Printf("StepInto: flags=%b, stepMode=%v\n", d.flags, d.stepMode)
 }
 
 // StepOut continues execution until the current function returns
@@ -263,6 +290,7 @@ func (d *Debugger) Pause() {
 func (d *Debugger) resolveBreakpoint(bp *Breakpoint) {
 	prg := d.runtime.vm.prg
 	if prg == nil || prg.src == nil {
+		d.logger.Printf("resolveBreakpoint: Cannot resolve BP #%d - no program loaded\n", bp.id)
 		return
 	}
 
@@ -278,10 +306,14 @@ func (d *Debugger) resolveBreakpoint(bp *Breakpoint) {
 					// Found a match - we accept any column on the same line
 					bp.pc = pc
 					d.pcBreakpoints[pc] = bp
+					d.logger.Printf("resolveBreakpoint: Resolved BP #%d to PC=%d\n", bp.id, pc)
 					break
 				}
 			}
 		}
+	}
+	if bp.pc < 0 {
+		d.logger.Printf("resolveBreakpoint: Failed to resolve BP #%d at %s:%d\n", bp.id, bp.SourcePos.Filename, bp.SourcePos.Line)
 	}
 }
 
@@ -306,11 +338,48 @@ func (d *Debugger) checkBreakpoint(vm *vm) bool {
 	// but the handler can decide whether to process them
 	if vm.prg == nil {
 		// Check if already paused or in step mode
-		return d.flags&FlagPaused != 0 || d.flags&FlagStepMode != 0
+		shouldPause := d.flags&FlagPaused != 0 || d.flags&FlagStepMode != 0
+		if shouldPause {
+			d.logger.Printf("checkBreakpoint: Native function, flags=%b, pausing=%v\n", d.flags, shouldPause)
+		}
+		return shouldPause
 	}
+	
+	// Special handling for step-into with call instructions
+	if d.flags&FlagStepMode != 0 && d.stepMode == DebugStepInto {
+		// Check if the current instruction is a call
+		if vm.pc >= 0 && vm.pc < len(vm.prg.code) {
+			// Log the instruction type for debugging
+			instr := vm.prg.code[vm.pc]
+			d.logger.Printf("checkBreakpoint: StepInto - instruction type: %T\n", instr)
+			
+			if _, isCall := instr.(call); isCall {
+				// We're about to execute a call instruction
+				// Don't pause now, let it execute and pause at the first instruction of the called function
+				d.logger.Printf("checkBreakpoint: StepInto on call instruction, deferring pause\n")
+				// Mark that we should continue stepping after the call
+				d.continueStepAfterCall = true
+				// Keep step mode active but don't pause yet
+				return false
+			}
+		}
+	}
+
+	// Log current state
+	currentLine := -1
+	if vm.prg.srcMap != nil && vm.pc < len(vm.prg.srcMap) {
+		item := vm.prg.srcMap[vm.pc]
+		if item.srcPos >= 0 && vm.prg.src != nil {
+			pos := vm.prg.src.Position(item.srcPos)
+			currentLine = pos.Line
+		}
+	}
+	d.logger.Printf("checkBreakpoint: PC=%d, Line=%d, flags=%b, stepMode=%v, callStackLen=%d, stepDepth=%d\n", 
+		vm.pc, currentLine, d.flags, d.stepMode, len(vm.callStack), d.stepDepth)
 
 	// Check if paused
 	if d.flags&FlagPaused != 0 {
+		d.logger.Println("checkBreakpoint: Already paused, returning true")
 		return true
 	}
 
@@ -318,6 +387,7 @@ func (d *Debugger) checkBreakpoint(vm *vm) bool {
 	if bp, exists := d.pcBreakpoints[vm.pc]; exists && bp.enabled {
 		bp.hit++
 		d.flags |= FlagPaused
+		d.logger.Printf("checkBreakpoint: Hit breakpoint #%d at PC=%d, hits=%d\n", bp.id, vm.pc, bp.hit)
 		return true
 	}
 
@@ -326,24 +396,58 @@ func (d *Debugger) checkBreakpoint(vm *vm) bool {
 		switch d.stepMode {
 		case DebugStepInto:
 			d.flags |= FlagPaused
+			d.logger.Printf("checkBreakpoint: StepInto - pausing at PC=%d, Line=%d\n", vm.pc, currentLine)
 			return true
 		case DebugStepOver:
 			if len(vm.callStack) <= d.stepDepth {
-				// Check if we're at a consecutive instruction or there was a jump
-				// This helps with control flow like if/else where we shouldn't pause
-				// in unreachable branches
-				isFirstStep := d.lastPC == -1
-				isConsecutive := vm.pc == d.lastPC+1
+				// Get current source line
+				currentLine := -1
+				if vm.prg != nil && vm.prg.srcMap != nil && vm.pc < len(vm.prg.srcMap) {
+					item := vm.prg.srcMap[vm.pc]
+					if item.srcPos >= 0 && vm.prg.src != nil {
+						pos := vm.prg.src.Position(item.srcPos)
+						currentLine = pos.Line
+					}
+				}
+				
+				// Check if we've moved to a different source line
+				isFirstStep := d.lastSourceLine == -1
+				isDifferentLine := currentLine > 0 && currentLine != d.lastSourceLine
 				isReturning := len(vm.callStack) < d.stepDepth
 				
-				if isFirstStep || isConsecutive || isReturning {
-					d.flags |= FlagPaused
-					return true
+				// Special handling: if we had a valid line before and now have an invalid line,
+				// continue stepping (we're probably in a transition state)
+				wasValidLine := d.lastSourceLine > 0
+				isInvalidLine := currentLine <= 0
+				
+				d.logger.Printf("checkBreakpoint: StepOver - currentLine=%d, lastLine=%d, firstStep=%v, diffLine=%v, returning=%v\n",
+					currentLine, d.lastSourceLine, isFirstStep, isDifferentLine, isReturning)
+				
+				if isFirstStep || isDifferentLine || isReturning {
+					// Only pause if we have a valid source position
+					if currentLine > 0 || isReturning {
+						d.flags |= FlagPaused
+						d.logger.Printf("checkBreakpoint: StepOver - pausing (firstStep=%v, diffLine=%v, returning=%v)\n",
+							isFirstStep, isDifferentLine, isReturning)
+						return true
+					}
 				}
+				
+				// If we were at a valid line and now at invalid, keep stepping
+				if wasValidLine && isInvalidLine {
+					// Don't pause, keep stepping
+					d.logger.Println("checkBreakpoint: StepOver - transitioning from valid to invalid line, continuing")
+					return false
+				}
+			} else {
+				d.logger.Printf("checkBreakpoint: StepOver - callStack depth %d > stepDepth %d, continuing\n",
+					len(vm.callStack), d.stepDepth)
 			}
 		case DebugStepOut:
 			if len(vm.callStack) < d.stepDepth {
 				d.flags |= FlagPaused
+				d.logger.Printf("checkBreakpoint: StepOut - pausing, callStack=%d < stepDepth=%d\n", 
+					len(vm.callStack), d.stepDepth)
 				return true
 			}
 		}
@@ -355,6 +459,7 @@ func (d *Debugger) checkBreakpoint(vm *vm) bool {
 // handlePause is called when the VM pauses
 func (d *Debugger) handlePause(vm *vm) {
 	// No need to skip native functions anymore - the handler can decide
+	d.logger.Printf("handlePause: Called, PC=%d, prg=%v\n", vm.pc, vm.prg != nil)
 
 	d.mu.RLock()
 	handler := d.handler
@@ -362,6 +467,7 @@ func (d *Debugger) handlePause(vm *vm) {
 
 	if handler == nil {
 		// No handler, just continue
+		d.logger.Println("handlePause: No handler set, continuing")
 		d.Continue()
 		return
 	}
@@ -433,7 +539,18 @@ func (d *Debugger) handlePause(vm *vm) {
 	state.DebugStack = d.buildDebugStack(vm)
 
 	// Call handler and process command
+	d.logger.Printf("handlePause: Calling handler at Line=%d, PC=%d, InNative=%v, NativeName=%s\n",
+		state.SourcePos.Line, state.PC, state.InNativeCall, state.NativeFunctionName)
+	
+	// Update lastSourceLine before calling handler
+	if state.SourcePos.Line > 0 {
+		d.mu.Lock()
+		d.lastSourceLine = state.SourcePos.Line
+		d.mu.Unlock()
+	}
+	
 	cmd := handler(state)
+	d.logger.Printf("handlePause: Handler returned command: %v\n", cmd)
 	
 	switch cmd {
 	case DebugContinue:
@@ -446,6 +563,7 @@ func (d *Debugger) handlePause(vm *vm) {
 		d.StepOut()
 	case DebugPause:
 		// Already paused, do nothing
+		d.logger.Println("handlePause: Already paused, no action")
 	}
 }
 
@@ -731,15 +849,16 @@ func (d *Debugger) Evaluate(expression string, frameID int) (Value, error) {
 // EvaluateInFrame evaluates an expression in the context of a specific stack frame
 func (d *Debugger) EvaluateInFrame(expression string, frameIndex int) (Value, error) {
 	d.mu.RLock()
-	defer d.mu.RUnlock()
-
+	
 	if d.runtime.vm == nil {
+		d.mu.RUnlock()
 		return nil, fmt.Errorf("no active execution context")
 	}
 
 	// Get the current call stack
 	stack := d.runtime.CaptureCallStack(0, nil)
 	if frameIndex < 0 || frameIndex >= len(stack) {
+		d.mu.RUnlock()
 		return nil, fmt.Errorf("invalid frame index: %d", frameIndex)
 	}
 
@@ -747,6 +866,7 @@ func (d *Debugger) EvaluateInFrame(expression string, frameIndex int) (Value, er
 
 	// If the frame has no context, evaluate in global scope
 	if frame.ctx == nil || frame.ctx.stash == nil {
+		d.mu.RUnlock()
 		return d.runtime.RunString(expression)
 	}
 
@@ -783,6 +903,9 @@ func (d *Debugger) EvaluateInFrame(expression string, frameIndex int) (Value, er
 
 	// Temporarily set the variables object as 'this'
 	d.runtime.globalObject = varsObj
+
+	// Release lock before evaluating
+	d.mu.RUnlock()
 
 	// Evaluate the expression
 	result, err := d.runtime.RunString(evalCode)

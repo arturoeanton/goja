@@ -623,7 +623,7 @@ func (s *scope) finaliseVarAlloc(stackOffset int) (stashSize, stackSize int) {
 		argsInStash = f.argsInStash
 	}
 	stackIdx, stashIdx := 0, 0
-	allInStash := s.isDynamic()
+	allInStash := s.isDynamic() || s.c.debugMode
 	var derivedCtor bool
 	if fs := s.nearestThis(); fs != nil && fs.funcType == funcDerivedCtor {
 		derivedCtor = true

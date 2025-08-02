@@ -634,19 +634,40 @@ func (vm *vm) run() {
 			break
 		}
 		
-		// Track actual instruction execution for debugger step-over BEFORE checking breakpoints
+		// Check debugger breakpoints BEFORE updating lastSourceLine
 		if vm.r.debugger != nil {
+			// Check if we should pause
+			if vm.r.debugger.checkBreakpoint(vm) {
+				if vm.r.debugger.logger != nil {
+					vm.r.debugger.logger.Printf("VM: Pausing at PC=%d\n", pc)
+				}
+				vm.r.debugger.handlePause(vm)
+			}
+			
+			// Update lastPC before executing
 			vm.r.debugger.mu.Lock()
 			vm.r.debugger.lastPC = pc
 			vm.r.debugger.mu.Unlock()
-			
-			// Check if we should pause
-			if vm.r.debugger.checkBreakpoint(vm) {
-				vm.r.debugger.handlePause(vm)
-			}
 		}
 		
 		vm.prg.code[pc].exec(vm)
+		
+		// Update lastSourceLine AFTER executing the instruction
+		if vm.r.debugger != nil {
+			vm.r.debugger.mu.Lock()
+			if vm.prg != nil && vm.prg.srcMap != nil && pc < len(vm.prg.srcMap) {
+				item := vm.prg.srcMap[pc]
+				if item.srcPos >= 0 && vm.prg.src != nil {
+					pos := vm.prg.src.Position(item.srcPos)
+					// Only update lastSourceLine if we have a valid line
+					// Don't update to 0 as it would prevent stopping at the next valid line
+					if pos.Line > 0 {
+						vm.r.debugger.lastSourceLine = pos.Line
+					}
+				}
+			}
+			vm.r.debugger.mu.Unlock()
+		}
 	}
 
 	if interrupted {
@@ -681,19 +702,40 @@ func (vm *vm) runWithProfiler() bool {
 			break
 		}
 		
-		// Track actual instruction execution for debugger step-over BEFORE checking breakpoints
+		// Check debugger breakpoints BEFORE updating lastSourceLine
 		if vm.r.debugger != nil {
+			// Check if we should pause
+			if vm.r.debugger.checkBreakpoint(vm) {
+				if vm.r.debugger.logger != nil {
+					vm.r.debugger.logger.Printf("VM: Pausing at PC=%d\n", pc)
+				}
+				vm.r.debugger.handlePause(vm)
+			}
+			
+			// Update lastPC before executing
 			vm.r.debugger.mu.Lock()
 			vm.r.debugger.lastPC = pc
 			vm.r.debugger.mu.Unlock()
-			
-			// Check if we should pause
-			if vm.r.debugger.checkBreakpoint(vm) {
-				vm.r.debugger.handlePause(vm)
-			}
 		}
 		
 		vm.prg.code[pc].exec(vm)
+		
+		// Update lastSourceLine AFTER executing the instruction
+		if vm.r.debugger != nil {
+			vm.r.debugger.mu.Lock()
+			if vm.prg != nil && vm.prg.srcMap != nil && pc < len(vm.prg.srcMap) {
+				item := vm.prg.srcMap[pc]
+				if item.srcPos >= 0 && vm.prg.src != nil {
+					pos := vm.prg.src.Position(item.srcPos)
+					// Only update lastSourceLine if we have a valid line
+					// Don't update to 0 as it would prevent stopping at the next valid line
+					if pos.Line > 0 {
+						vm.r.debugger.lastSourceLine = pos.Line
+					}
+				}
+			}
+			vm.r.debugger.mu.Unlock()
+		}
 		req := atomic.LoadInt32(&pt.req)
 		if req == profReqStop {
 			return true
