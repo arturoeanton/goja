@@ -5,6 +5,13 @@ ECMAScript 5.1(+) implementation in Go.
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/dop251/goja.svg)](https://pkg.go.dev/github.com/dop251/goja)
 
+> **Note about this fork**: This fork includes extensive debugging support for Goja. We attempted to contribute these changes upstream through a minimal pull request, but due to the scope and timing of the changes, it wasn't accepted at that time. As debugging support is critical for our projects and for improving integration quality, we've continued development in this fork. We deeply appreciate the excellent work by dop251 and the entire Goja project. We understand that integrating substantial debugging features requires careful consideration, and we respect the maintainer's decision. This fork remains available for those who need debugging capabilities now. Should dop251 decide to merge these changes with the upstream project in the future, it would bring us great joy and satisfaction to see our contributions benefit the broader Goja community.
+>
+> **Using this fork**: To use this fork in your Go project, add the following replace directive to your `go.mod` file:
+> ```
+> replace github.com/dop251/goja => github.com/arturoeanton/goja latest
+> ```
+
 Goja is an implementation of ECMAScript 5.1 in pure Go with emphasis on standard compliance and
 performance.
 
